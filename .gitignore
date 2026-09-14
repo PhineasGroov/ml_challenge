@@ -1,0 +1,14 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
+/jpg
+data/
+runs/
+checkpoints/
+logs/
+*.pth
+*.pt
+*.ckpt
+*.pdf

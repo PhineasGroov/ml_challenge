@@ -7,6 +7,7 @@ On assemble ici les briques deja construites :
 """
 
 from pathlib import Path
+import json
 
 import torch
 from torch import nn, optim
@@ -14,12 +15,12 @@ from torch.utils.data import DataLoader
 
 from load import ColorizationDataset, list_image_files, split_files
 from model import UNet
+from model_resnet import ResNetUNet
 
 
 def get_device() -> torch.device:
-    # TODO J : renvoyer torch.device("cuda") si torch.cuda.is_available(),
-    # sinon torch.device("cpu"). (Indice : torch.cuda.is_available() renvoie un bool)
-    if torch.cuda.is_available() :
+    # Renvoie torch.device("cuda") si torch.cuda.is_available(), sinon cpu
+    if torch.cuda.is_available():
         return torch.device("cuda")
     return torch.device("cpu")
 
@@ -30,15 +31,6 @@ def build_dataloaders(
     batch_size: int = 32,
 ) -> tuple[DataLoader, DataLoader, DataLoader]:
     """Construit les DataLoader train / val / test."""
-    # TODO K :
-    #   1. files = list_image_files(root)
-    #   2. train_files, val_files, test_files = split_files(files)
-    #   3. creer les 3 ColorizationDataset (un par liste de fichiers)
-    #   4. creer les 3 DataLoader correspondants. Attention :
-    #      - shuffle=True uniquement pour le train (val/test : shuffle=False,
-    #        pas besoin de melanger puisqu'on ne met pas a jour les poids)
-    #      - meme batch_size pour les 3 (par simplicite)
-    #   5. renvoyer (train_loader, val_loader, test_loader)
     files = list_image_files(root)
     train_files, val_files, test_files = split_files(files)
     train_dataset = ColorizationDataset(train_files, image_size=image_size)
@@ -109,17 +101,30 @@ def evaluate(
 def main() -> None:
     import argparse
 
-    parser = argparse.ArgumentParser(description="Entrainement U-Net pour la colorisation")
+    parser = argparse.ArgumentParser(description="Entrainement du modele pour la colorisation")
     parser.add_argument("--root", type=str, default="..", help="Dossier racine contenant jpg/")
+    parser.add_argument("--model", type=str, default="resnet18", choices=["unet", "resnet18"],
+                        help="Architecture a entrainer : 'unet' (baseline) ou 'resnet18' (transfer learning)")
     parser.add_argument("--image-size", type=int, default=128)
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--epochs", type=int, default=20)
     parser.add_argument("--lr", type=float, default=1e-3)
-    parser.add_argument("--checkpoint", type=str, default="checkpoints/unet_mse.pth")
+    parser.add_argument("--unfreeze-encoder", action="store_true",
+                        help="Degele l'encodeur ResNet pour entrainer tous les poids (par defaut l'encodeur est gele)")
+    parser.add_argument("--checkpoint", type=str, default=None,
+                        help="Chemin de sauvegarde du modele (par defaut checkpoints/<model>_mse.pth)")
+    parser.add_argument("--history", type=str, default=None,
+                        help="Chemin de sauvegarde de l'historique JSON des pertes")
     args = parser.parse_args()
 
     device = get_device()
-    print(f"Device : {device}")
+    print(f"Appareil utilise (Device) : {device}")
+
+    # Choix du nom par defaut des checkpoints
+    if args.checkpoint is None:
+        args.checkpoint = f"checkpoints/{args.model}_mse.pth"
+    if args.history is None:
+        args.history = f"checkpoints/history_{args.model}.json"
 
     train_loader, val_loader, test_loader = build_dataloaders(
         args.root, image_size=args.image_size, batch_size=args.batch_size
@@ -128,17 +133,40 @@ def main() -> None:
           f"Val: {len(val_loader.dataset)} images | "
           f"Test: {len(test_loader.dataset)} images")
 
-    model = UNet().to(device)
+    # Instanciation de l'architecture choisie
+    if args.model == "unet":
+        print("Architecture : U-Net classique (entraine a partir de zero)")
+        model = UNet().to(device)
+    elif args.model == "resnet18":
+        freeze = not args.unfreeze_encoder
+        status_str = "gele (freeze)" if freeze else "non gele (fine-tuning complet)"
+        print(f"Architecture : ResNet-18 U-Net (Pre-entraine sur ImageNet, encodeur {status_str})")
+        model = ResNetUNet(pretrained=True, freeze_encoder=freeze).to(device)
+
     criterion = nn.MSELoss()
-    optimizer = optim.Adam(model.parameters(), lr=args.lr)
+    # On n'optimise que les parametres qui requierent un gradient (particulierement utile si l'encodeur est gele)
+    trainable_params = [p for p in model.parameters() if p.requires_grad]
+    optimizer = optim.Adam(trainable_params, lr=args.lr)
 
     checkpoint_path = Path(args.checkpoint)
     checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
     best_val_loss = float("inf")
 
+    history = {
+        "model": args.model,
+        "epochs": args.epochs,
+        "lr": args.lr,
+        "train_loss": [],
+        "val_loss": [],
+    }
+
+    print(f"\nDebut de l'entrainement pour {args.epochs} epoques...")
     for epoch in range(1, args.epochs + 1):
         train_loss = train_one_epoch(model, train_loader, criterion, optimizer, device)
         val_loss = evaluate(model, val_loader, criterion, device)
+
+        history["train_loss"].append(train_loss)
+        history["val_loss"].append(val_loss)
 
         print(f"Epoch {epoch:3d}/{args.epochs} - "
               f"train_loss: {train_loss:.5f} - val_loss: {val_loss:.5f}")
@@ -148,8 +176,13 @@ def main() -> None:
             torch.save(model.state_dict(), checkpoint_path)
             print(f"  -> nouveau meilleur modele sauvegarde ({checkpoint_path})")
 
-    print(f"Entrainement termine. Meilleure val_loss : {best_val_loss:.5f}")
+    # Sauvegarde de l'historique JSON pour tracer les courbes de loss dans le rapport
+    with open(args.history, "w") as f:
+        json.dump(history, f, indent=4)
+    print(f"Historique d'entrainement enregistre dans {args.history}")
+    print(f"Entrainement termine. Meilleure val_loss : {best_val_loss:.5f}\n")
 
 
 if __name__ == "__main__":
     main()
+

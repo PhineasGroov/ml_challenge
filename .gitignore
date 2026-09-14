@@ -12,3 +12,4 @@ logs/
 *.pt
 *.ckpt
 *.pdf
+/checkpoints/*
